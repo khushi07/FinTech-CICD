@@ -1,0 +1,215 @@
+trigger:
+  branches:
+    include:
+      - main
+      - staging
+
+pr:
+  branches:
+    include:
+      - main
+      - staging
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  nodeVersion: '22.x'
+
+stages:
+
+# ==========================================
+# BUILD
+# ==========================================
+
+- stage: Build
+  displayName: 'Build Application'
+
+  jobs:
+  - job: Build
+    displayName: 'Build Node.js Application'
+
+    steps:
+
+    - task: NodeTool@0
+      displayName: 'Install Node.js'
+      inputs:
+        versionSpec: '$(nodeVersion)'
+
+    - script: |
+        npm ci
+      displayName: 'Install Dependencies'
+
+    - script: |
+        npm run build --if-present
+      displayName: 'Build Application'
+
+    - task: ArchiveFiles@2
+      displayName: 'Create Application Package'
+      inputs:
+        rootFolderOrFile: '$(Build.SourcesDirectory)'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/fintech-app.zip'
+        replaceExistingArchive: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Build Artifact'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/fintech-app.zip'
+        ArtifactName: 'fintech-app'
+        publishLocation: 'Container'
+
+
+# ==========================================
+# TEST
+# ==========================================
+
+- stage: Test
+  displayName: 'Test and Code Quality'
+
+  dependsOn: Build
+
+  jobs:
+  - job: Test
+    displayName: 'Run Automated Tests'
+
+    steps:
+
+    - task: NodeTool@0
+      displayName: 'Install Node.js'
+      inputs:
+        versionSpec: '$(nodeVersion)'
+
+    - script: |
+        npm ci
+      displayName: 'Install Dependencies'
+
+    - script: |
+        npm test
+      displayName: 'Run Unit Tests and Coverage'
+
+
+# ==========================================
+# DEPLOY DEV
+# ==========================================
+
+- stage: Deploy_Dev
+  displayName: 'Deploy to Dev'
+
+  dependsOn:
+    - Build
+    - Test
+
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployDev
+    displayName: 'Deploy to Dev App Service'
+
+    environment: fintech-dev
+
+    strategy:
+      runOnce:
+        deploy:
+
+          steps:
+
+          - download: current
+            artifact: fintech-app
+
+          - task: AzureWebApp@1
+            displayName: 'Deploy to Dev'
+            inputs:
+              azureSubscription: 'fintech-azure-connection'
+              appType: 'webAppLinux'
+              appName: 'fintech-dev-khushi'
+              package: '$(Pipeline.Workspace)/fintech-app/fintech-app.zip'
+
+
+# ==========================================
+# DEPLOY STAGING
+# ==========================================
+
+- stage: Deploy_Staging
+  displayName: 'Deploy to Staging'
+
+  dependsOn:
+    - Deploy_Dev
+
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployStaging
+    displayName: 'Deploy to Staging App Service'
+
+    environment: fintech-staging
+
+    strategy:
+      runOnce:
+        deploy:
+
+          steps:
+
+          - download: current
+            artifact: fintech-app
+
+          - task: AzureWebApp@1
+            displayName: 'Deploy to Staging'
+            inputs:
+              azureSubscription: 'fintech-azure-connection'
+              appType: 'webAppLinux'
+              appName: 'fintech-staging-khushi'
+              package: '$(Pipeline.Workspace)/fintech-app/fintech-app.zip'
+
+
+# ==========================================
+# DEPLOY PROD
+# ==========================================
+
+- stage: Deploy_Prod
+  displayName: 'Deploy to Production'
+
+  dependsOn:
+    - Deploy_Staging
+
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployProd
+    displayName: 'Blue-Green Production Deployment'
+
+    environment: fintech-prod
+
+    strategy:
+      runOnce:
+        deploy:
+
+          steps:
+
+          - download: current
+            artifact: fintech-app
+
+          - task: AzureWebApp@1
+            displayName: 'Deploy to Production Staging Slot'
+            inputs:
+              azureSubscription: 'fintech-azure-connection'
+              appType: 'webAppLinux'
+              appName: 'fintech-prod-khushi'
+              deployToSlotOrASE: true
+              resourceGroupName: 'rg-fintech-cicd'
+              slotName: 'staging'
+              package: '$(Pipeline.Workspace)/fintech-app/fintech-app.zip'
+
+          - task: AzureCLI@2
+            displayName: 'Swap Staging Slot to Production'
+            inputs:
+              azureSubscription: 'fintech-azure-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az webapp deployment slot swap \
+                  --resource-group rg-fintech-cicd \
+                  --name fintech-prod-khushi \
+                  --slot staging \
+                  --target-slot production
